@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CommandCode 每月限额助手
 // @namespace    https://commandcode.ai/ccx-meter
-// @version      1.5.0
+// @version      1.6.0
 // @description  增强 commandcode.ai 用量页：联动页面「刷新」按钮强制同步限额（站点刷新不更新用量限额），同步后直接补丁三张限额卡（百分比/格子/重置倒计时）、「每月限额」安全限额警示线，按周期固定日均（自然日/工作日分摊，月中不重算不压缩）
 // @author       ws1993
 // @match        https://commandcode.ai/*
@@ -255,15 +255,21 @@
     return { start: dayStart(start), est: est };
   }
 
-  // 周期统计：全周期日历天数与工作日数（起点当日计入，重置日不计入）
+  // 周期统计：全周期天数/工作日数 + 今天是周期内第几天（含当天）
+  // 起点·第 1 天计入，重置日不计入；tIdx 钳制在周期范围内防异常时钟
   function cycleStats(start, resetAt, now) {
     var days = Math.max(1, Math.round((dayStart(resetAt) - start) / 86400000));
-    var i, w, workdays = 0;
+    var tIdx = Math.max(0, Math.min(days - 1, Math.round((dayStart(now) - start) / 86400000)));
+    var i, w, workdays = 0, elapsedWorkdays = 0;
     for (i = 0; i < days; i++) {
       w = new Date(start.getTime() + i * 86400000).getDay();
-      if (w >= 1 && w <= 5) workdays++;
+      if (w >= 1 && w <= 5) { workdays++; if (i <= tIdx) elapsedWorkdays++; }
     }
-    return { days: days, workdays: workdays, todayWorkday: now.getDay() >= 1 && now.getDay() <= 5 };
+    return {
+      days: days, workdays: workdays,
+      elapsedDays: tIdx + 1, elapsedWorkdays: elapsedWorkdays,
+      todayWorkday: now.getDay() >= 1 && now.getDay() <= 5
+    };
   }
 
   /* ============================ 站点卡片补丁 ============================ */
@@ -345,20 +351,19 @@
     var left = state.resetAt.getTime() - now.getTime();
     var cyc = locateCycle(state.resetAt);
     var cs = cycleStats(cyc.start, state.resetAt, now);
-
-    // 固定日均 = 周期总额（100%）÷ 周期天数/工作日数，周期开局锁定；
-    // 月中不重算，不随剩余量压缩后续配额
-    var perDay, todayAvail, capLine;
+    // 固定日均 = 周期总额（100%）÷ 周期天数/工作日数，周期开局锁定，月中不重算；
+    // 今日安全限额 = 固定日均 × 周期内已过天数（含今天）累计节奏线
+    var perDay, capBase, capLine;
     if (mode === 'workday') {
       perDay = 100 / Math.max(1, cs.workdays);
-      todayAvail = cs.todayWorkday ? perDay : 0;
+      capBase = cs.elapsedWorkdays;
       capLine = '今日安全限额' + (cs.todayWorkday ? '' : '（休息日）');
     } else {
       perDay = 100 / cs.days;
-      todayAvail = perDay;
+      capBase = cs.elapsedDays;
       capLine = '今日安全限额';
     }
-    var todayCap = Math.min(100, used + todayAvail);
+    var todayCap = Math.min(100, perDay * capBase);
 
     // ── 补丁每月限额卡（同步值生效时直接重写站点显示）──
     if (state.sync && state.sync.monthly) patchLimit(mL, used, null);
@@ -383,19 +388,20 @@
       capMarker.setAttribute('style', S.mk + 'left:calc(' + capPct + '% - 1px);');
     }
 
-    // ── 补丁 5 小时 / 每周限额卡（百分比 + 实时重置倒计时）──
+    // ── 补丁 5 小时 / 每周限额卡：仅接管重置倒计时文案（pct=null）──
+    // 这两张卡的 credits.used/cap 口径与站点显示不一致，不接管数字/格子；缺失则整卡不动
     if (state.sync) {
-      patchLimit(findLimitItem(CFG.FIVE_RE), state.sync.five.pct, state.sync.five.resetAt);
-      patchLimit(findLimitItem(CFG.WEEK_RE), state.sync.weekly.pct, state.sync.weekly.resetAt);
+      if (state.sync.five) patchLimit(findLimitItem(CFG.FIVE_RE), null, state.sync.five.resetAt);
+      if (state.sync.weekly) patchLimit(findLimitItem(CFG.WEEK_RE), null, state.sync.weekly.resetAt);
     }
 
     var modeNote;
     if (mode === 'workday') {
       modeNote = cs.todayWorkday
-        ? '固定日均 = 100% ÷ 周期 ' + cs.workdays + ' 个工作日，月中不重算'
-        : '今日为休息日，不消耗工作日配额（每日配额维持 ' + fmtPct(perDay) + '%）';
+        ? '固定日均 = 100% ÷ 周期 ' + cs.workdays + ' 个工作日 = ' + fmtPct(perDay) + '%/天；已过 ' + cs.elapsedWorkdays + ' 个工作日'
+        : '今日为休息日，不消耗工作日配额（累计线维持 ' + fmtPct(todayCap) + '%）';
     } else {
-      modeNote = '固定日均 = 100% ÷ 周期 ' + cs.days + ' 个自然日，月中不重算';
+      modeNote = '固定日均 = 100% ÷ 周期 ' + cs.days + ' 个自然日 = ' + fmtPct(perDay) + '%/天；今日为周期第 ' + cs.elapsedDays + ' 天';
     }
 
     var val = 'text-align:right;';
@@ -411,11 +417,13 @@
         '<span style="' + val + '">' + fmtDT(state.resetAt) +
           (state.precise ? '' : ' *') + '</span>' +
       '</div>' +
+      '<div style="' + S.row + '">' +
         '<span style="' + S.lab + '">剩余额度</span>' +
         '<span style="' + val + '">' + fmtPct(remaining) + '% · 周期 ' + (mode === 'workday'
           ? cs.workdays + ' 工作日'
           : cs.days + ' 天') + '</span>' +
       '</div>' +
+      '<div style="' + S.row + '">' +
         '<span style="' + S.lab + '">今日配额（固定）</span>' +
         '<span style="' + val + '">+' + fmtPct(perDay) + '%</span>' +
       '</div>' +
@@ -427,7 +435,8 @@
         '<span style="' + S.lab + '">模式</span>' +
         chipHTML('natural') + chipHTML('workday') +
       '</div>' +
-        modeNote + '；安全限额 = 已用 ' + fmtPct(used) + '% + 固定日均（整周期不变）' +
+      '<p style="' + S.note + '">' +
+        modeNote + '；安全限额 = 固定日均 × 周期内已过天数（累计节奏线，整周期口径不变）' +
         (cyc.est ? '；周期起点为估算，下次重置后自动校准' : '') +
         (state.precise ? '' : '；* 时间由页面文本推算') +
         (state.sync ? '；额度已同步服务器' : '；额度与页面进度一致（可能滞后，稍后自动同步）') +
