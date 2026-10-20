@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CommandCode 每月限额助手
 // @namespace    https://commandcode.ai/ccx-meter
-// @version      1.6.0
-// @description  增强 commandcode.ai 用量页：联动页面「刷新」按钮强制同步限额（站点刷新不更新用量限额），同步后直接补丁三张限额卡（百分比/格子/重置倒计时）、「每月限额」安全限额警示线，按周期固定日均（自然日/工作日分摊，月中不重算不压缩）
+// @version      1.7.0
+// @description  增强 commandcode.ai 用量页：分钟级自动同步服务器额度，三张限额卡（每月/5 小时/每周）的百分比、进度格与重置倒计时随倒计时同拍自动刷新，无需重载页面；联动页面「刷新」按钮强制同步，并补充「每月限额」安全限额警示线与按周期固定日均（自然日/工作日分摊，月中不重算不压缩）
 // @author       ws1993
 // @match        https://commandcode.ai/*
 // @connect      api.commandcode.ai
@@ -26,12 +26,19 @@
     SUBS_API: 'https://api.commandcode.ai/internal/billing/subscriptions?withPending=true',
     CREDITS_API: 'https://api.commandcode.ai/internal/billing/credits',
     USAGE_API: 'https://api.commandcode.ai/internal/usage/summary',
-    CALIBRATE_MS: 5 * 60 * 1000,                     // 例行同步周期
+    SYNC_MS: 60 * 1000,                              // 分钟节拍（与倒计时同拍刷新占比）
+    MIN_SYNC_MS: 20 * 1000,                          // 两次拉取的最小间隔，防重复触发
+    FULL_MS: 5 * 60 * 1000,                          // 全量同步周期（含订阅精确重置时刻）
     FALLBACK_RESET_HOUR: 0,                          // DOM 推算重置日的默认时刻（本地 0 点）
     ACCENT: '#76DEC8',
     RED: '#E5484D',
-    CELL_LIT: 'flex-1 min-w-[2px] transition-colors duration-500 bg-[#76DEC8]',  // 已用格
-    CELL_OFF: 'flex-1 min-w-[2px] transition-colors duration-500 bg-muted'       // 剩余格
+    WARN_PCT: 70,                                    // 站点转橙阈值（>=70% peach）
+    HOT_PCT: 90,                                     // 站点转红阈值（>=90% coral）
+    CELL_BASE: 'flex-1 min-w-[2px] transition-colors duration-500',
+    OFF: 'bg-muted',
+    ON_TEAL: 'bg-[#76DEC8]',
+    ON_PEACH: 'bg-[#F1B27E]',
+    ON_CORAL: 'bg-[#EF8169]'
   };
 
   var MODES = { natural: '自然日', workday: '工作日' };
@@ -41,11 +48,14 @@
   var state = {
     resetAt: null,   // 每月重置时刻（Date）：优先订阅接口精确值，否则 DOM 文本推算
     precise: false,
-    sync: null       // 服务器同步结果 { five:{pct,resetAt}, weekly:{pct,resetAt}, monthly:{pct} }
+    sync: null,      // 服务器快照 { five:{pct,resetAt,exceeded}, weekly:{…}, monthly:{pct} }
+    lastSync: 0,     // 最近一次同步成功时刻（面板回显，证明占比在自动刷新）
+    syncErr: null    // 最近一次同步失败原因
   };
   var mode = loadMode();
   var capEl = null;       // 「今日安全限额」红字标签
   var capMarker = null;   // 进度条警示竖线
+  var padEl = null;       // 本脚本面板容器（观察器据此忽略自身写入）
 
   /* ============================ 工具函数 ============================ */
 
@@ -74,21 +84,40 @@
     return d > 0 ? (d + '天 ' + h + '小时 ' + m + '分') : (h + '小时 ' + m + '分');
   }
 
-  // 5 小时/每周卡片的重置文案（与站点格式一致，但每分钟实时）
-  function fmtResetIn(ms) {
+  function num(v) {
+    if (typeof v === 'number') return isFinite(v) ? v : null;
+    if (typeof v === 'string' && v.trim() !== '') { var n = parseFloat(v); return isFinite(n) ? n : null; }
+    return null;
+  }
+
+  // 5 小时/每周卡片的重置文案，与站点 ca() 同口径：horizon='long'（每周）才显示天
+  function fmtResetIn(ms, horizon) {
     if (ms == null) return null;
     if (ms <= 0) return '正在重置…';
-    var d = Math.floor(ms / 86400000);
-    var h = Math.floor(ms % 86400000 / 3600000);
-    var m = Math.floor(ms % 3600000 / 60000);
-    if (d > 0) return d + ' 天 ' + h + ' 小时后重置';
-    if (h > 0) return h + ' 小时 ' + m + ' 分钟后重置';
-    return m + ' 分钟后重置';
+    var a = Math.floor(ms / 60000);           // 剩余分钟
+    var h = Math.floor(a / 60);
+    var d = Math.floor(h / 24);
+    if (horizon === 'long' && d >= 1) {
+      var rh = h - d * 24;
+      return rh > 0 ? d + ' 天 ' + rh + ' 小时后重置' : d + ' 天后重置';
+    }
+    if (h >= 1) {
+      var rm = a - h * 60;
+      return rm > 0 ? h + ' 小时 ' + rm + ' 分钟后重置' : h + ' 小时后重置';
+    }
+    return Math.max(1, a) + ' 分钟后重置';
   }
 
   function fmtDT(t) {
     return (t.getMonth() + 1) + '月' + t.getDate() + '日 ' +
       String(t.getHours()).padStart(2, '0') + ':' + String(t.getMinutes()).padStart(2, '0');
+  }
+
+  function fmtClock(ms) {
+    var t = new Date(ms);
+    return String(t.getHours()).padStart(2, '0') + ':' +
+      String(t.getMinutes()).padStart(2, '0') + ':' +
+      String(t.getSeconds()).padStart(2, '0');
   }
 
   /* ============================ 数据获取 ============================ */
@@ -172,48 +201,77 @@
     } catch (e) { viaGM(); }
   }
 
-  // 汇总同步：订阅(精确重置时刻) + usage/summary(月度已用) + credits(配额与窗口限额)
-  function fetchAll(cb) {
-    var result = null, pend = 2;
-    var done = function () { if (--pend === 0) cb(result ? null : new Error('no-data'), result); };
-    apiJson(CFG.SUBS_API, function (err, j) {
-      if (!err && j && j.data && j.data.currentPeriodEnd) {
-        var t = new Date(j.data.currentPeriodEnd);
-        if (!isNaN(t.getTime())) { state.resetAt = t; state.precise = true; }
-      }
-      done();
-    });
-    apiJson(CFG.USAGE_API, function (errU, u) {
-      var used = errU || !u || !isFinite(u.totalMonthlyCredits) ? null : u.totalMonthlyCredits;
-      apiJson(CFG.CREDITS_API, function (errC, c) {
-        var credits = (!errC && c && c.credits) || null;
-        var w = (credits && credits.windowLimits) || {};
-        var wp = function (x) { return x && x.cap > 0 ? x.used / x.cap * 100 : null; };
-        if (credits && credits.monthlyCreditsGranted > 0 && used != null) {
-          result = {
-            monthly: { pct: used / credits.monthlyCreditsGranted * 100 }
-          };
-          // 5 小时/每周：credits 的 used/cap 口径与站点显示不一致（实测 3.3% vs 10%），
-          // 故 pct 仅在可算时携带，resetAt 为服务器权威值始终携带；
-          // render 侧按 pct=null 调用 → 只重写倒计时文案，不接管站点数字/格子
-          var fh = w.fiveHour, fwp = wp(fh);
-          if (fwp != null || (fh && fh.resetAt)) {
-            result.five = { pct: fwp, resetAt: fh && fh.resetAt ? new Date(fh.resetAt) : null };
-          }
-          var wko = w.weekly, kwp = wp(wko);
-          if (kwp != null || (wko && wko.resetAt)) {
-            result.weekly = { pct: kwp, resetAt: wko && wko.resetAt ? new Date(wko.resetAt) : null };
-          }
-        }
-        done();
-      });
-    });
+  // 站点口径：windowLimits 位于 /internal/billing/credits 响应的**根层**（不在 credits 内）
+  // 取整公式与站点一致：pct = min(100, round(used / cap * 100))，cap<=0 记 0，exceeded 记满
+  function evalPct(x) {
+    if (!x) return null;
+    if (x.exceeded) return 100;
+    var cap = num(x.cap);
+    if (cap == null || cap <= 0) return 0;
+    var used = num(x.used);
+    return Math.max(0, Math.min(100, (used == null ? 0 : used) / cap * 100));
   }
 
-  function calibrate() {
-    fetchAll(function (err, data) {
-      if (!err && data) { state.sync = data; render(); }
-      // 失败时保留上一次结果或 DOM 值，不打断本轮渲染
+  // 时间字段兼容：秒/毫秒时间戳或 ISO 字符串
+  function toMs(v) {
+    if (v == null || v === '') return null;
+    if (typeof v === 'number' && isFinite(v)) return v < 1e12 ? v * 1000 : v;
+    if (/^\d+$/.test(String(v))) { var n = +String(v); return n < 1e12 ? n * 1000 : n; }
+    var t = Date.parse(v);
+    return isNaN(t) ? null : t;
+  }
+
+  // 本轮接口结果 → 同步快照；本轮缺失的项沿用上一次的值，不回退到静态 DOM
+  function mergeSync(out) {
+    var prev = state.sync || {}, next = {};
+    var c = out.credits || null;
+    var inner = (c && c.credits) || c || {};
+    var w = (c && c.windowLimits) || (c && c.credits && c.credits.windowLimits) || null;
+    var granted = num(inner.monthlyCreditsGranted != null ? inner.monthlyCreditsGranted : (c && c.monthlyCreditsGranted));
+    var remain = num(inner.monthlyCredits != null ? inner.monthlyCredits : (c && c.monthlyCredits));
+
+    // 月度：两条同步路径统一用站点同源口径（granted - 剩余），避免全量/轻量之间来回跳；
+    //       概览接口仅在 credits 未给出剩余时兜底
+    if (granted && granted > 0) {
+      var mp = null;
+      if (remain != null) {
+        mp = Math.max(0, Math.min(granted, granted - remain)) / granted * 100;
+      } else if (out.summary) {
+        var us = num(out.summary.totalMonthlyCredits);
+        if (us != null) mp = us / granted * 100;
+      }
+      if (mp != null) next.monthly = { pct: Math.max(0, Math.min(100, mp)) };
+    }
+
+    if (w) {
+      if (w.fiveHour) next.five = { pct: evalPct(w.fiveHour), resetAt: toMs(w.fiveHour.resetAt), exceeded: !!w.fiveHour.exceeded };
+      if (w.weekly) next.weekly = { pct: evalPct(w.weekly), resetAt: toMs(w.weekly.resetAt), exceeded: !!w.weekly.exceeded };
+    }
+
+    ['monthly', 'five', 'weekly'].forEach(function (k) { if (!next[k] && prev[k]) next[k] = prev[k]; });
+    return (next.monthly || next.five || next.weekly) ? next : null;
+  }
+
+  // 同步：full = 订阅(精确重置时刻) + 概览(本月已用) + credits(窗口限额)
+  //       full=false → 只拉 credits（分钟级轻量刷新，单请求）
+  function fetchAll(cb, full) {
+    var out = {}, pend = full ? 3 : 1;
+    var finish = function () { if (--pend === 0) cb(mergeSync(out)); };
+    if (full) {
+      apiJson(CFG.SUBS_API, function (err, j) {
+        var d = err ? null : ((j && j.data) || j);
+        var t = d && toMs(d.currentPeriodEnd);
+        if (t) { state.resetAt = new Date(t); state.precise = true; }
+        finish();
+      });
+      apiJson(CFG.USAGE_API, function (err, u) {
+        if (!err && u) out.summary = u;
+        finish();
+      });
+    }
+    apiJson(CFG.CREDITS_API, function (err, c) {
+      if (!err && c) out.credits = c;
+      finish();
     });
   }
 
@@ -274,29 +332,46 @@
 
   /* ============================ 站点卡片补丁 ============================ */
 
-  // 用同步值重写限额卡。pct 传 null 时跳过数字/格子（不动站点口径），仅重写重置倒计时文案
-  function patchLimit(L, pct, resetAt) {
+  // 格子配色分档（与站点 oa()+dr 表一致）：<70% 青，70~90% 橙，≥90% 或超限 珊瑚红
+  function cellTone(pct, exceeded) {
+    var on = (exceeded || pct >= CFG.HOT_PCT) ? CFG.ON_CORAL
+           : pct >= CFG.WARN_PCT ? CFG.ON_PEACH : CFG.ON_TEAL;
+    return { on: CFG.CELL_BASE + ' ' + on, off: CFG.CELL_BASE + ' ' + CFG.OFF };
+  }
+
+  // 用同步值重写限额卡：数字、格子、aria、重置倒计时文案
+  // pct 传 null 时跳过数字/格子（保留站点自身口径），仅重写倒计时
+  function patchLimit(L, pct, resetAt, exceeded, horizon) {
     if (!L || !L.item) return;
     var pb = L.item.querySelector('[role="progressbar"]');
     if (!pb) return;
     if (pct != null && isFinite(pct)) {
-      var p2 = Math.max(0, Math.min(100, pct));
-      if (L.pct) L.pct.textContent = Math.floor(p2) + '%';         // 与站点取整口径一致
-      pb.setAttribute('aria-valuenow', String(Math.floor(p2)));
+      var p2 = Math.max(0, Math.min(100, Math.round(pct)));   // 站点为 Math.round
+      if (L.pct) {
+        var want = p2 + '%';
+        if (L.pct.textContent !== want) L.pct.textContent = want;
+        // 内联色用节点记忆：浏览器会规范化 var() 串，实时读回比较会每轮都误判为“有变化”
+        var color = exceeded ? 'var(--color-red-500,#ef4444)' : '';
+        if (L.pct.__ccxColor !== color) { L.pct.__ccxColor = color; L.pct.style.color = color; }
+      }
+      if (pb.getAttribute('aria-valuenow') !== String(p2)) pb.setAttribute('aria-valuenow', String(p2));
       var cells = [];
       for (var i = 0; i < pb.children.length; i++) {
         var c = pb.children[i];
         if (!(c.getAttribute && c.getAttribute('data-ccx-marker'))) cells.push(c);
       }
-      var lit = Math.round(p2 * cells.length / 100);
+      // 站点亮格口径 Ft()：pct>0 时至少点亮 1 格
+      var lit = p2 > 0 ? Math.max(1, Math.round(p2 * cells.length / 100)) : 0;
+      var tone = cellTone(p2, exceeded);
       for (i = 0; i < cells.length; i++) {
-        var target = i < lit ? CFG.CELL_LIT : CFG.CELL_OFF;
+        var target = i < lit ? tone.on : tone.off;
         if (cells[i].className !== target) cells[i].className = target;
       }
     }
     if (resetAt && L.p) {
-      var txt = fmtResetIn(resetAt.getTime() - Date.now());
-      if (txt) L.p.textContent = txt;
+      var ms = (resetAt instanceof Date ? resetAt.getTime() : +resetAt) - Date.now();
+      var txt = fmtResetIn(ms, horizon);
+      if (txt && L.p.textContent !== txt) L.p.textContent = txt;
     }
   }
 
@@ -333,10 +408,11 @@
     var pad = document.getElementById(CFG.PAD_ID);
     if (!pad) { pad = document.createElement('div'); pad.id = CFG.PAD_ID; pad.addEventListener('click', onPadClick); }
     if (pad.parentElement !== mL.item) mL.item.appendChild(pad);
+    padEl = pad;
 
     // 用量：优先服务器同步值，回退站点进度条
     var used = state.sync && state.sync.monthly ? state.sync.monthly.pct : readUsedPercent(mL.item);
-    if (!isFinite(used)) { pad.textContent = ''; return; }
+    if (!isFinite(used)) { if (pad.__ccx !== '') { pad.__ccx = ''; pad.textContent = ''; } return; }
     used = Math.max(0, Math.min(100, used));
     var remaining = Math.max(0, 100 - used);
 
@@ -365,34 +441,43 @@
     }
     var todayCap = Math.min(100, perDay * capBase);
 
-    // ── 补丁每月限额卡（同步值生效时直接重写站点显示）──
-    if (state.sync && state.sync.monthly) patchLimit(mL, used, null);
+    // ── 补丁每月限额卡（同步值生效时直接重写站点数字与格子）──
+    if (state.sync && state.sync.monthly) patchLimit(mL, used, null, Math.round(used) >= 100);
 
-    // ── 红字标签 + 进度条警示线 ──
+    // ── 红字标签 + 进度条警示线（全部按节点记忆做差异写入，防观察器空转）──
     var pb = mL.item.querySelector('[role="progressbar"]');
     var rowEl = mL.row;
     if (pb && rowEl) {
       var capPct = Math.max(0, Math.min(100, todayCap));
+      var capTxt = capLine + '： ' + fmtPct(todayCap) + '%';
       if (!capEl) capEl = document.createElement('span');
       if (capEl.parentElement !== rowEl || capEl !== rowEl.children[1]) {
         rowEl.insertBefore(capEl, rowEl.children[1] || null);
       }
-      capEl.setAttribute('data-ccx-cap', '1');
-      capEl.setAttribute('style', S.cap);
-      capEl.textContent = capLine + '： ' + fmtPct(todayCap) + '%';
+      if (capEl.__ccxCap !== '1') {
+        capEl.__ccxCap = '1';
+        capEl.setAttribute('data-ccx-cap', '1');
+      }
+      if (capEl.__ccxStyle !== S.cap) { capEl.__ccxStyle = S.cap; capEl.setAttribute('style', S.cap); }
+      if (capEl.__ccxTxt !== capTxt) { capEl.__ccxTxt = capTxt; capEl.textContent = capTxt; }
 
-      pb.style.position = 'relative';
+      if (pb.__ccxPos !== 'relative') { pb.__ccxPos = 'relative'; pb.style.position = 'relative'; }
       if (!capMarker) capMarker = document.createElement('div');
       if (capMarker.parentElement !== pb) pb.appendChild(capMarker);
-      capMarker.setAttribute('data-ccx-marker', '1');
-      capMarker.setAttribute('style', S.mk + 'left:calc(' + capPct + '% - 1px);');
+      if (capMarker.__ccxMk !== '1') {
+        capMarker.__ccxMk = '1';
+        capMarker.setAttribute('data-ccx-marker', '1');
+      }
+      var mkStyle = S.mk + 'left:calc(' + capPct + '% - 1px);';
+      if (capMarker.__ccxStyle !== mkStyle) { capMarker.__ccxStyle = mkStyle; capMarker.setAttribute('style', mkStyle); }
     }
 
-    // ── 补丁 5 小时 / 每周限额卡：仅接管重置倒计时文案（pct=null）──
-    // 这两张卡的 credits.used/cap 口径与站点显示不一致，不接管数字/格子；缺失则整卡不动
+    // ── 补丁 5 小时 / 每周限额卡：数字 + 格子 + 重置倒计时全部接管 ──
+    // 数据同源（credits 接口根层 windowLimits），口径与站点一致，故可安全覆写
     if (state.sync) {
-      if (state.sync.five) patchLimit(findLimitItem(CFG.FIVE_RE), null, state.sync.five.resetAt);
-      if (state.sync.weekly) patchLimit(findLimitItem(CFG.WEEK_RE), null, state.sync.weekly.resetAt);
+      var f = state.sync.five, wk = state.sync.weekly;
+      if (f) patchLimit(findLimitItem(CFG.FIVE_RE), f.pct, f.resetAt, f.exceeded, 'short');
+      if (wk) patchLimit(findLimitItem(CFG.WEEK_RE), wk.pct, wk.resetAt, wk.exceeded, 'long');
     }
 
     var modeNote;
@@ -406,8 +491,11 @@
 
     var val = 'text-align:right;';
     var accent = val + 'color:' + CFG.ACCENT + ';';
+    var stamp = state.lastSync
+      ? '额度已自动同步 ' + fmtClock(state.lastSync)
+      : (state.syncErr ? '额度同步未成功，下一分钟自动重试' : '额度等待首次同步');
 
-    pad.innerHTML =
+    var html =
       '<div style="' + S.row + 'border-top:1px solid var(--color-border,var(--border,#222225));padding-top:13px;">' +
         '<span style="' + S.lab + '">重置倒计时</span>' +
         '<span style="' + accent + '">' + fmtCountdown(left) + '</span>' +
@@ -439,8 +527,11 @@
         modeNote + '；安全限额 = 固定日均 × 周期内已过天数（累计节奏线，整周期口径不变）' +
         (cyc.est ? '；周期起点为估算，下次重置后自动校准' : '') +
         (state.precise ? '' : '；* 时间由页面文本推算') +
-        (state.sync ? '；额度已同步服务器' : '；额度与页面进度一致（可能滞后，稍后自动同步）') +
+        '；' + stamp + '（每 ' + Math.round(CFG.SYNC_MS / 1000) + ' 秒）' +
       '</p>';
+
+    // 内容无变化则不写 DOM：避免观察器自激，也不打断文本选中
+    if (pad.__ccx !== html) { pad.__ccx = html; pad.innerHTML = html; }
   }
 
   function onPadClick(e) {
@@ -456,43 +547,90 @@
 
   /* ============================ 生命周期 ============================ */
 
-  // 每分钟对齐刷新（倒计时精确到分钟；同步值存在时顺带重贴站点卡片补丁）
+  var syncing = false;
+
+  // 同步入口：full=true 全量（订阅 + 概览 + 额度）；否则只拉 credits（1 个请求，分钟级）
+  function sync(full) {
+    if (syncing || document.hidden) return;                     // 后台标签页不打接口
+    if (!full && Date.now() - state.lastSync < CFG.MIN_SYNC_MS) return;
+    syncing = true;
+    fetchAll(function (res) {
+      syncing = false;
+      if (res) {
+        state.sync = res;
+        state.syncErr = null;
+        state.lastSync = Date.now();
+      } else {
+        state.syncErr = '数据';
+      }
+      render();
+    }, !!full);
+  }
+
+  // 分钟节拍：整点对齐，先刷新倒计时与节奏线，再拉一次最新用量占比
+  function tick() { render(); sync(false); }
   function minuteLoop() {
     var now = new Date();
     var next = now.getTime() - now.getMilliseconds() - now.getSeconds() * 1000 + 60000;
-    setTimeout(function () { render(); minuteLoop(); }, next - now.getTime());
+    setTimeout(function () { tick(); minuteLoop(); }, next - now.getTime());
+  }
+  function fullLoop() {
+    setTimeout(function () { sync(true); fullLoop(); }, CFG.FULL_MS);
   }
 
-  ['pushState', 'replaceState'].forEach(function (k) {
-    var orig = history[k];
-    history[k] = function () { var r = orig.apply(this, arguments); scheduleCheck(); return r; };
-  });
-  window.addEventListener('popstate', scheduleCheck);
-
+  // 站点 React 重渲染会覆盖我们的补丁 → 下一帧重新贴回（render 幂等，无差异不写 DOM）
   var checkTimer = null;
   function scheduleCheck() {
     if (checkTimer) return;
-    checkTimer = setTimeout(function () {
-      checkTimer = null;
-      if (!document.getElementById(CFG.PAD_ID)) render();
-    }, 200);
+    checkTimer = setTimeout(function () { checkTimer = null; render(); }, 200);
   }
-  new MutationObserver(scheduleCheck).observe(document.body, { childList: true, subtree: true });
 
-  // 站点「刷新」按钮只重取概览接口，不更新用量限额 → 点击后强制同步两次
-  document.addEventListener('click', function (e) {
-    var b = e.target && e.target.closest ? e.target.closest('button') : null;
-    if (!b || e.target.closest('#' + CFG.PAD_ID)) return;
-    var t = (b.textContent || '').trim();
-    if (t.length <= 12 && /刷新|refresh/i.test(t)) {
-      setTimeout(calibrate, 400);
-      setTimeout(calibrate, 1600);
+  function bindLifecycle() {
+    ['pushState', 'replaceState'].forEach(function (k) {
+      var orig = history[k];
+      history[k] = function () { var r = orig.apply(this, arguments); scheduleCheck(); return r; };
+    });
+    window.addEventListener('popstate', scheduleCheck);
+
+    if (document.body) {
+      new MutationObserver(function (muts) {
+        for (var i = 0; i < muts.length; i++) {
+          var t = muts[i].target;
+          if (t && t.nodeType === 3) t = t.parentElement;
+          if (padEl && t && (t === padEl || padEl.contains(t))) continue;  // 忽略自身面板写入
+          scheduleCheck();
+          return;
+        }
+      }).observe(document.body, { childList: true, subtree: true });
     }
-  }, true);
 
-  // 启动：先按 DOM 渲染兜底，再异步同步服务器
-  render();
-  calibrate();
-  setInterval(calibrate, CFG.CALIBRATE_MS);
-  minuteLoop();
+    // 切回前台/窗口聚焦时立即补一次，避免看到的是几分钟前的旧占比
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) sync(false); });
+    window.addEventListener('focus', function () { sync(false); });
+
+    // 站点「刷新」按钮只重取概览接口，不更新用量限额 → 点击后强制全量同步两次
+    document.addEventListener('click', function (e) {
+      var b = e.target && e.target.closest ? e.target.closest('button') : null;
+      if (!b || e.target.closest('#' + CFG.PAD_ID)) return;
+      var t = (b.textContent || '').trim();
+      if (t.length <= 12 && /刷新|refresh/i.test(t)) {
+        setTimeout(function () { sync(true); }, 400);
+        setTimeout(function () { sync(true); }, 1600);
+      }
+    }, true);
+  }
+
+  // 启动：DOM 就绪后按页面兜底渲染 → 全量同步一次 → 进入分钟级自动刷新
+  function boot() {
+    bindLifecycle();
+    render();
+    sync(true);
+    minuteLoop();
+    fullLoop();
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
 })();
